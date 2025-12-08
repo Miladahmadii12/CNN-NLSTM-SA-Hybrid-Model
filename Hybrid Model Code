@@ -1,0 +1,168 @@
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, Conv1D, SpatialDropout1D, MultiHeadAttention, LayerNormalization, Dropout, Reshape, BatchNormalization, Layer, Flatten, Add
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.losses import Huber
+from sklearn.metrics import r2_score, mean_squared_error
+import numpy as np
+
+# N-ary Tree LSTM Cell
+class NaryTreeLSTMCell(tf.keras.layers.Layer):
+    def __init__(self, units, N):
+        super(NaryTreeLSTMCell, self).__init__()
+        self.units = units
+        self.N = N
+        self.W_i = tf.keras.layers.Dense(units, use_bias=False)
+        self.W_o = tf.keras.layers.Dense(units, use_bias=False)
+        self.W_u = tf.keras.layers.Dense(units, use_bias=False)
+        self.W_f = [tf.keras.layers.Dense(units, use_bias=False) for _ in range(N)]
+        self.U_i = tf.keras.layers.Dense(units)
+        self.U_o = tf.keras.layers.Dense(units)
+        self.U_u = tf.keras.layers.Dense(units)
+        self.U_f = [tf.keras.layers.Dense(units) for _ in range(N)]
+        self.b_i = tf.Variable(tf.zeros([units]))
+        self.b_o = tf.Variable(tf.zeros([units]))
+        self.b_u = tf.Variable(tf.zeros([units]))
+        self.b_f = [tf.Variable(tf.zeros([units])) for _ in range(N)]
+
+    def call(self, x, h_children, c_children):
+        if h_children is None:
+            h_children = [tf.zeros((tf.shape(x)[0], self.units))] * self.N
+            c_children = [tf.zeros((tf.shape(x)[0], self.units))] * self.N
+        h_concat = tf.concat(h_children, axis=1)
+        i = tf.sigmoid(self.W_i(x) + self.U_i(h_concat) + self.b_i)
+        o = tf.sigmoid(self.W_o(x) + self.U_o(h_concat) + self.b_o)
+        u = tf.tanh(self.W_u(x) + self.U_u(h_concat) + self.b_u)
+        f = [tf.sigmoid(self.W_f[k](x) + self.U_f[k](h_concat) + self.b_f[k]) for k in range(self.N)]
+        c = i * u
+        for k in range(self.N):
+            c += f[k] * c_children[k]
+        h = o * tf.tanh(c)
+        return h, c
+
+# N-ary Tree LSTM Layer
+class NaryTreeLSTM(tf.keras.Model):
+    def __init__(self, units, N, max_nodes):
+        super(NaryTreeLSTM, self).__init__()
+        self.units = units
+        self.N = N
+        self.max_nodes = max_nodes
+        self.tree_lstm_cell = NaryTreeLSTMCell(units, N)
+
+    def call(self, inputs):
+        batch_size = tf.shape(inputs)[0]
+        h_states = []
+        c_states = []
+        for i in range(self.max_nodes):
+            start_index = max(0, i - self.N // 2)
+            end_index = min(self.max_nodes, i + (self.N // 2) + 1) if self.N % 2 == 0 else min(self.max_nodes, i + (self.N // 2) + 1)
+            h_children = h_states[start_index:end_index]
+            c_children = c_states[start_index:end_index]
+            while len(h_children) < self.N:
+                h_children.append(tf.zeros((batch_size, self.units)))
+                c_children.append(tf.zeros((batch_size, self.units)))
+            if i < self.N:
+                h, c = self.tree_lstm_cell(inputs[:, i, :], None, None)
+            else:
+                h, c = self.tree_lstm_cell(inputs[:, i, :], h_children, c_children)
+            h_states.append(h)
+            c_states.append(c)
+        return tf.stack(h_states, axis=1)  # (batch_size, max_nodes, units)
+
+# Positional Encoding Layer
+class PositionalEncodingLayer(Layer):
+    def __init__(self, seq_len, d_model):
+        super(PositionalEncodingLayer, self).__init__()
+        self.d_model = d_model
+        self.seq_len = seq_len
+        self.pos_encoding = self.positional_encoding(seq_len, d_model)
+
+    def get_angles(self, pos, i):
+        angle_rates = 1 / tf.math.pow(10000, (2 * (i // 2)) / tf.cast(self.d_model, tf.float32))
+        return pos * angle_rates
+
+    def positional_encoding(self, position, d_model):
+        pos = tf.range(position, dtype=tf.float32)[:, tf.newaxis]
+        i = tf.range(d_model, dtype=tf.float32)[tf.newaxis, :]
+        angle_rads = self.get_angles(pos, i)
+        angle_rads = tf.where(i % 2 == 0, tf.math.sin(angle_rads), tf.math.cos(angle_rads))
+        pos_encoding = angle_rads[tf.newaxis, ...]
+        return tf.cast(pos_encoding, dtype=tf.float32)
+
+    def call(self, inputs):
+        pos_encoding = tf.repeat(self.pos_encoding, repeats=tf.shape(inputs)[0], axis=0)
+        return inputs + pos_encoding
+
+# Build Hybrid Model (Core Function)
+def build_hybrid_model(input_shape, d_model=128, num_heads=4, num_outputs=1, N=3):
+    """Build the CNN-NLSTM-SA hybrid model."""
+    input_layer = Input(shape=input_shape)  # (batch_size, time_steps, features)
+    seq_len = input_shape[0]
+    feature_dim = input_shape[1]
+
+    # Positional Encoding
+    pos_encoding = PositionalEncodingLayer(seq_len=seq_len, d_model=feature_dim)(input_layer)
+
+    # Embedding
+    embedding_layer = Dense(d_model, activation='relu', kernel_regularizer=l2(0.001), kernel_initializer='he_uniform')(pos_encoding)
+    embedding_layer = BatchNormalization()(embedding_layer)
+
+    # CNN Branch
+    conv_layer = Conv1D(filters=d_model, kernel_size=3, activation='relu', padding="same",
+                        kernel_regularizer=l2(0.001), kernel_initializer='he_uniform')(embedding_layer)
+    conv_layer = BatchNormalization()(conv_layer)
+    conv_layer = SpatialDropout1D(0.2)(conv_layer)
+
+    # NLSTM Branch
+    nary_tree_lstm = NaryTreeLSTM(units=d_model, N=N, max_nodes=input_shape[0])(embedding_layer)
+    nary_tree_lstm = Dropout(0.2)(nary_tree_lstm)
+
+    # Add Branches
+    combined = Add()([conv_layer, nary_tree_lstm])
+
+    # Q/K/V for Attention
+    q_layer = Dense(d_model, kernel_regularizer=l2(0.001), kernel_initializer='he_uniform')(combined)
+    k_layer = Dense(d_model, kernel_regularizer=l2(0.001), kernel_initializer='he_uniform')(combined)
+    v_layer = Dense(d_model, kernel_regularizer=l2(0.001), kernel_initializer='he_uniform')(combined)
+
+    # Multi-Head Attention
+    multi_head_attention = MultiHeadAttention(num_heads=num_heads, key_dim=d_model)(q_layer, k_layer, v_layer)
+    x = LayerNormalization(epsilon=1e-6)(multi_head_attention)
+    x = Dropout(0.1)(x)
+
+    # Flatten and Output
+    x = Flatten()(x)
+    output_layer = Dense(num_outputs, kernel_regularizer=l2(0.001), kernel_initializer='he_uniform')(x)
+    output_layer = Dropout(0.1)(output_layer)
+    output_layer = Reshape((num_outputs, 1))(output_layer)
+
+    model = Model(inputs=input_layer, outputs=output_layer)
+    return model
+
+# Example Usage: Train and Evaluate (Minimal)
+# Assume you have X_train, y_train, X_val, y_val, X_test, y_test (scaled data)
+time_steps = 36
+step_predict = 360
+input_shape = (time_steps, 10)  # Example: 10 features
+
+model = build_hybrid_model(input_shape=input_shape, num_outputs=step_predict)
+
+# Compile
+huber_loss = Huber(delta=1.0)
+model.compile(optimizer='adam', loss=huber_loss, metrics=['mae', 'mse'])
+
+# Callbacks
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+]
+
+# Train (replace with your data)
+# history = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=100, batch_size=64, callbacks=callbacks)
+
+# Predict and Metrics (replace with your data)
+# y_pred = model.predict(X_test)
+# r2 = r2_score(y_test.flatten(), y_pred.flatten())
+# rmse = np.sqrt(mean_squared_error(y_test.flatten(), y_pred.flatten()))
+# print(f"R²: {r2:.4f}, RMSE: {rmse:.4f}")

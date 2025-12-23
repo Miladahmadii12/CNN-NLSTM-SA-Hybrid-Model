@@ -1,0 +1,39 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+import os
+
+def load_and_preprocess_station(data_path, station_id):
+    df = pd.read_csv(os.path.join(data_path, f'{station_id}_15min.csv'), parse_dates=['datetime'])
+    if 'flag' in df.columns:
+        df = df[df['flag'] == 'A'].drop(columns=['flag'])
+    df = df.set_index('datetime').resample('H').mean().reset_index()
+    df = df.sort_values('datetime').reset_index(drop=True)
+    df['datetime'] = df['datetime'].dt.tz_convert('UTC') if df['datetime'].dt.tz else df['datetime'].dt.tz_localize('UTC')
+    return df
+
+def prepare_data(inputs, target, time_steps, step_predict):
+    X, y, indices = [], [], []
+    for i in range(len(inputs) - time_steps - step_predict + 1):
+        input_window = inputs[i:i + time_steps]
+        target_window = target[i + time_steps:i + time_steps + step_predict]
+        if np.isnan(input_window).any() or np.isnan(target_window).any():
+            continue
+        X.append(input_window)
+        y.append(target_window)
+        indices.append(i + time_steps)
+    return np.array(X), np.array(y), indices
+
+def scale_transform(X):
+    X_array = X.values if isinstance(X, pd.DataFrame) else X
+    min_max_scalerX = MinMaxScaler().fit(X_array)
+    X_trans_final = min_max_scalerX.transform(X_array)
+    return X_trans_final, min_max_scalerX
+
+def data_to_initial_scale(y_predicted, min_max_scalerX):
+    original_shape = y_predicted.shape
+    y_predicted_2d = y_predicted.reshape(-1, 1)
+    y_rescaled = min_max_scalerX.inverse_transform(y_predicted_2d)
+    y_rescaled = y_rescaled.reshape(original_shape)
+    return y_rescaled

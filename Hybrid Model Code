@@ -7,10 +7,10 @@ from tensorflow.keras.losses import Huber
 from sklearn.metrics import r2_score, mean_squared_error
 import numpy as np
 
-# N-ary Tree LSTM Cell
-class NaryTreeLSTMCell(tf.keras.layers.Layer):
+# NLSTM Cell 
+class NLSTMCell(tf.keras.layers.Layer):
     def __init__(self, units, N):
-        super(NaryTreeLSTMCell, self).__init__()
+        super(NLSTMCell, self).__init__()
         self.units = units
         self.N = N
         self.W_i = tf.keras.layers.Dense(units, use_bias=False)
@@ -41,33 +41,31 @@ class NaryTreeLSTMCell(tf.keras.layers.Layer):
         h = o * tf.tanh(c)
         return h, c
 
-# N-ary Tree LSTM Layer
-class NaryTreeLSTM(tf.keras.Model):
+
+class NLSTM(tf.keras.Model):
     def __init__(self, units, N, max_nodes):
-        super(NaryTreeLSTM, self).__init__()
+        super(NLSTM, self).__init__()
         self.units = units
         self.N = N
         self.max_nodes = max_nodes
-        self.tree_lstm_cell = NaryTreeLSTMCell(units, N)
+        self.nlstm_cell = NLSTMCell(units, N)
 
     def call(self, inputs):
         batch_size = tf.shape(inputs)[0]
+        zero_state = tf.zeros((batch_size, self.units))
+
+        h_history = [zero_state] * self.N  # rolling buffer of the N most recent PAST states
+        c_history = [zero_state] * self.N
         h_states = []
-        c_states = []
+
         for i in range(self.max_nodes):
-            start_index = max(0, i - self.N // 2)
-            end_index = min(self.max_nodes, i + (self.N // 2) + 1) if self.N % 2 == 0 else min(self.max_nodes, i + (self.N // 2) + 1)
-            h_children = h_states[start_index:end_index]
-            c_children = c_states[start_index:end_index]
-            while len(h_children) < self.N:
-                h_children.append(tf.zeros((batch_size, self.units)))
-                c_children.append(tf.zeros((batch_size, self.units)))
-            if i < self.N:
-                h, c = self.tree_lstm_cell(inputs[:, i, :], None, None)
-            else:
-                h, c = self.tree_lstm_cell(inputs[:, i, :], h_children, c_children)
+            h_children = h_history[-self.N:]  # strictly past states, no future leakage
+            c_children = c_history[-self.N:]
+            h, c = self.nlstm_cell(inputs[:, i, :], h_children, c_children)
             h_states.append(h)
-            c_states.append(c)
+            h_history.append(h)
+            c_history.append(c)
+
         return tf.stack(h_states, axis=1)  # (batch_size, max_nodes, units)
 
 # Positional Encoding Layer
@@ -115,11 +113,11 @@ def build_hybrid_model(input_shape, d_model=128, num_heads=4, num_outputs=1, N=3
     conv_layer = SpatialDropout1D(0.2)(conv_layer)
 
     # NLSTM Branch
-    nary_tree_lstm = NaryTreeLSTM(units=d_model, N=N, max_nodes=input_shape[0])(embedding_layer)
-    nary_tree_lstm = Dropout(0.2)(nary_tree_lstm)
+    nlstm_branch = NLSTM(units=d_model, N=N, max_nodes=input_shape[0])(embedding_layer)
+    nlstm_branch = Dropout(0.2)(nlstm_branch)
 
     # Add Branches
-    combined = Add()([conv_layer, nary_tree_lstm])
+    combined = Add()([conv_layer, nlstm_branch])
 
     # Q/K/V for Attention
     q_layer = Dense(d_model, kernel_regularizer=l2(0.001), kernel_initializer='he_uniform')(combined)
